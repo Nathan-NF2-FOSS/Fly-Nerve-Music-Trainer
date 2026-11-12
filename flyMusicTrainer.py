@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from flybrain import FlyBrain
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix
 import matplotlib.pyplot as plt
@@ -50,7 +50,7 @@ music_scales = {
     "Double Harmonic Major": [1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1]
 }
 
-# STEP 5: Run Data Collection Loop
+# STEP 5: Run Data Collection Loop (Batch / Static)
 X_data = []
 y_labels = []
 
@@ -67,7 +67,7 @@ for scale_name, pitch_vec in music_scales.items():
 X_data = np.array(X_data)
 y_labels = np.array(y_labels)
 
-# STEP 6: Train, Evaluate, and Track Performance
+# STEP 6: Train, Evaluate, and Track Static Performance
 X_train, X_test, y_train, y_test = train_test_split(
     X_data, y_labels, test_size=0.3, random_state=42
 )
@@ -97,7 +97,7 @@ for scale, stats in scale_tracker.items():
     pct = (correct / total) * 100 if total > 0 else 0
     print(f"  • {scale:<25}: {correct}/{total} correct ({pct:.1f}%)")
 
-# STEP 7: Visualizations
+# STEP 7: Visualizations (Static State & Initial Confusion Matrix)
 sample_states = []
 scale_names_list = list(music_scales.keys())
 
@@ -129,48 +129,128 @@ plt.tight_layout()
 plt.show()
 
 
-from sklearn.linear_model import SGDClassifier
-# Initialize an online-learning classifier instead of static LogisticRegression
-# loss='log_loss' gives us probabilistic outputs similar to Logistic Regression
-decoder = SGDClassifier(loss='log_loss', max_iter=1000, random_state=42)
+from sklearn.preprocessing import StandardScaler
 
-# Define our scale labels for partial fitting
+# STEP 8: Iterative Learning with Baseline (Epoch 0) Evaluation
+print("\nPreparing fixed evaluation dataset...")
+X_eval_raw = []
+y_eval = []
+for scale_name, pitch_vec in music_scales.items():
+    for _ in range(10):
+        noisy_input = np.array(pitch_vec, dtype=float) + np.random.normal(0, 0.05, 12)
+        binary_noisy = (noisy_input > 0.5).astype(int)
+        brain_state = simulate_musical_input(brain, pitch_bins, binary_noisy, steps=20)
+        X_eval_raw.append(brain_state)
+        y_eval.append(scale_name)
+
+X_eval_raw = np.array(X_eval_raw)
+y_eval = np.array(y_eval)
+
+# Initialize Scaler and fit on evaluation data
+scaler = StandardScaler()
+X_eval = scaler.fit_transform(X_eval_raw)
+
+# SGDClassifier starts with random weights (untrained baseline)
+decoder = SGDClassifier(
+    loss='log_loss', 
+    max_iter=1000, 
+    learning_rate='constant', 
+    eta0=0.001, 
+    alpha=0.0001,
+    random_state=42
+)
 all_scale_names = list(music_scales.keys())
 
-print()
-print("--- Training Fly Brain with Iterative Learning (Epochs) ---")
-epochs = 5
+epochs = 10
+accuracy_history = []
 
+# --- 1. EVALUATE UNTRAINED BASELINE (Epoch 0) ---
+print("\nEvaluating Untrained Baseline (Epoch 0)...")
+# Force classes initialization without fitting weights yet
+decoder.partial_fit(X_eval[0].reshape(1, -1), np.array([y_eval[0]]), classes=all_scale_names)
+# Reset weights back to completely random/zero state for a true clean slate
+decoder.coef_ = np.zeros_like(decoder.coef_)
+decoder.intercept_ = np.zeros_like(decoder.intercept_)
+
+y_pred_baseline = decoder.predict(X_eval)
+baseline_accuracy = accuracy_score(y_eval, y_pred_baseline) * 100
+accuracy_history.append(baseline_accuracy)
+
+cm_baseline = confusion_matrix(y_eval, y_pred_baseline, labels=all_scale_names)
+plt.figure(figsize=(7, 5))
+sns.heatmap(cm_baseline, annot=True, fmt="d", cmap="Purples",
+            xticklabels=all_scale_names, yticklabels=all_scale_names)
+plt.title(f"Epoch 0 (Untrained Baseline)\nAccuracy: {baseline_accuracy:.1f}%")
+plt.xlabel("Predicted Scale")
+plt.ylabel("Actual Scale")
+plt.xticks(rotation=45, ha="right")
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+
+# --- 2. TRAINING EPOCHS ---
+print("\nTraining Fly Brain Across Epochs:")
 for epoch in range(epochs):
-    print(f"\nEpoch {epoch + 1} of {epochs}")
-    correct_count = 0
-    total_count = 0
+    if epoch < 4:
+        phase = "GROWTH (Learning phase)"
+        noise_level = 0.02 + (epoch * 0.03)
+    elif epoch < 7:
+        phase = "PEAK (Optimal cognitive state)"
+        noise_level = 0.12
+    else:
+        phase = "DECAY (Cognitive overload / heavy noise)"
+        noise_level = 0.25 + ((epoch - 6) * 0.15)
+        
+    print(f"\n--- Epoch {epoch + 1} of {epochs} [{phase}] ---")
+    
+    X_epoch_train = []
+    y_epoch_train = []
     
     for scale_name, pitch_vec in music_scales.items():
-        for trial in range(5):  # 5 trials per epoch per scale
-            # Add noise
-            noisy_input = np.array(pitch_vec, dtype=float) + np.random.normal(0, 0.05, 12)
+        for trial in range(3):
+            noisy_input = np.array(pitch_vec, dtype=float) + np.random.normal(0, noise_level, 12)
             binary_noisy = (noisy_input > 0.5).astype(int)
             
-            # Keep the SAME 'brain' instance alive across trials and epochs
             brain_state = simulate_musical_input(brain, pitch_bins, binary_noisy, steps=20)
+            X_epoch_train.append(brain_state)
+            y_epoch_train.append(scale_name)
             
-            X_sample = brain_state.reshape(1, -1)
-            y_sample = np.array([scale_name])
+    X_epoch_train = scaler.transform(np.array(X_epoch_train))
+    y_epoch_train = np.array(y_epoch_train)
+    
+    # Train sequentially on this epoch's data
+    for x_sample, y_sample in zip(X_epoch_train, y_epoch_train):
+        decoder.partial_fit(x_sample.reshape(1, -1), np.array([y_sample]), classes=all_scale_names)
             
-            # If the decoder has already seen data, test its guess BEFORE it learns from this trial
-            if epoch > 0 or total_count > 0:
-                pred = decoder.predict(X_sample)
-                if pred[0] == scale_name:
-                    correct_count += 1
-            
-            total_count += 1
-            
-            # Incrementally update (learn) the decoder weights using this single experience
-            decoder.partial_fit(X_sample, y_sample, classes=all_scale_names)
+    # Evaluate performance after this epoch's training
+    y_pred_epoch = decoder.predict(X_eval)
+    epoch_accuracy = accuracy_score(y_eval, y_pred_epoch) * 100
+    accuracy_history.append(epoch_accuracy)
+    
+    print(f"  -> Noise Level: {noise_level:.2f} | Test Accuracy: {epoch_accuracy:.2f}%")
+    
+    cm_epoch = confusion_matrix(y_eval, y_pred_epoch, labels=all_scale_names)
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(cm_epoch, annot=True, fmt="d", cmap="Purples",
+                xticklabels=all_scale_names, yticklabels=all_scale_names)
+    plt.title(f"Epoch {epoch + 1} ({phase})\nAccuracy: {epoch_accuracy:.1f}% | Noise: {noise_level:.2f}")
+    plt.xlabel("Predicted Scale")
+    plt.ylabel("Actual Scale")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
 
-    if epoch > 0:
-        epoch_accuracy = (correct_count / total_count) * 100
-        print(f"  -> Epoch {epoch + 1} Accuracy: {epoch_accuracy:.2f}%")
+# Final Learning Curve Summary
+plt.figure(figsize=(8, 4))
+plt.plot(range(0, epochs + 1), accuracy_history, marker='o', color='b', linestyle='-', linewidth=2)
+plt.title("Fly Brain Cognitive Learning & Decay Curve (Epoch 0 to 10)")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy (%)")
+plt.grid(True)
+plt.ylim(0, 105)
+plt.tight_layout()
+plt.show()
 
-print("\nLearning Complete")
+print("\nSimulation Complete!")
